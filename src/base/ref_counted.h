@@ -1,5 +1,5 @@
-#ifndef MRPC_BASE_REF_COUNTED_H_
-#define MRPC_BASE_REF_COUNTED_H_
+#ifndef BASE_MEMORY_REF_COUNTED_H_
+#define BASE_MEMORY_REF_COUNTED_H_
 
 #include <cassert>
 #include <iosfwd>
@@ -15,11 +15,28 @@ class RefCountedBase {
 
  protected:
   RefCountedBase()
-    : ref_count_(0) {}
-  ~RefCountedBase() {}
+      : ref_count_(0)
+      {
+  }
 
-  void AddRef() const { ++ref_count_; }
-  bool Release() const { 
+  ~RefCountedBase() {
+  }
+
+
+  void AddRef() const {
+    // TODO(maruel): Add back once it doesn't assert 500 times/sec.
+    // Current thread books the critical section "AddRelease"
+    // without release it.
+    // DFAKE_SCOPED_LOCK_THREAD_LOCKED(add_release_);
+    ++ref_count_;
+  }
+
+  // Returns true if the object should self-delete.
+  bool Release() const {
+    // TODO(maruel): Add back once it doesn't assert 500 times/sec.
+    // Current thread books the critical section "AddRelease"
+    // without release it.
+    // DFAKE_SCOPED_LOCK_THREAD_LOCKED(add_release_);
     if (--ref_count_ == 0) {
       return true;
     }
@@ -28,6 +45,8 @@ class RefCountedBase {
 
  private:
   mutable int ref_count_;
+
+
   DISALLOW_COPY_AND_ASSIGN(RefCountedBase);
 };
 
@@ -40,14 +59,32 @@ class RefCountedThreadSafeBase {
   ~RefCountedThreadSafeBase();
 
   void AddRef() const;
+
+  // Returns true if the object should self-delete.
   bool Release() const;
 
  private:
   mutable AtomicRefCount ref_count_;
+
   DISALLOW_COPY_AND_ASSIGN(RefCountedThreadSafeBase);
 };
 
-template<typename T>
+
+//
+// A base class for reference counted classes.  Otherwise, known as a cheap
+// knock-off of WebKit's RefCounted<T> class.  To use this guy just extend your
+// class from it like so:
+//
+//   class MyFoo : public mrpc::RefCounted<MyFoo> {
+//    ...
+//    private:
+//     friend class mrpc::RefCounted<MyFoo>;
+//     ~MyFoo();
+//   };
+//
+// You should always make your destructor non-public, to avoid any code deleting
+// the object accidently while there are references to it.
+template <class T>
 class RefCounted : public RefCountedBase {
  public:
   RefCounted() {}
@@ -69,17 +106,35 @@ class RefCounted : public RefCountedBase {
   DISALLOW_COPY_AND_ASSIGN(RefCounted<T>);
 };
 
-template<typename T, typename Traits> class RefCountedThreadSafe;
+// Forward declaration.
+template <class T, typename Traits> class RefCountedThreadSafe;
 
+// Default traits for RefCountedThreadSafe<T>.  Deletes the object when its ref
+// count reaches 0.  Overload to delete it on a different thread etc.
 template<typename T>
 struct DefaultRefCountedThreadSafeTraits {
   static void Destruct(const T* x) {
+    // Delete through RefCountedThreadSafe to make child classes only need to be
+    // friend with RefCountedThreadSafe instead of this struct, which is an
+    // implementation detail.
     RefCountedThreadSafe<T,
-	                 DefaultRefCountedThreadSafeTraits>::DeleteInternal(x);
+                         DefaultRefCountedThreadSafeTraits>::DeleteInternal(x);
   }
 };
 
-template<typename T, typename Traits = DefaultRefCountedThreadSafeTraits<T>>
+//
+// A thread-safe variant of RefCounted<T>
+//
+//   class MyFoo : public mrpc::RefCountedThreadSafe<MyFoo> {
+//    ...
+//   };
+//
+// If you're using the default trait, then you should add compile time
+// asserts that no one else is deleting your object.  i.e.
+//    private:
+//     friend class mrpc::RefCountedThreadSafe<MyFoo>;
+//     ~MyFoo();
+template <class T, typename Traits = DefaultRefCountedThreadSafeTraits<T> >
 class RefCountedThreadSafe : public RefCountedThreadSafeBase {
  public:
   RefCountedThreadSafe() {}
@@ -104,85 +159,135 @@ class RefCountedThreadSafe : public RefCountedThreadSafeBase {
   DISALLOW_COPY_AND_ASSIGN(RefCountedThreadSafe);
 };
 
-template <typename T>
+//
+// A thread-safe wrapper for some piece of data so we can place other
+// things in scoped_refptrs<>.
+//
+template<typename T>
 class RefCountedData
-    : public RefCountedThreadSafe<RefCountedData<T>> {
+    : public mrpc::RefCountedThreadSafe< mrpc::RefCountedData<T> > {
  public:
   RefCountedData() : data() {}
   RefCountedData(const T& in_value) : data(in_value) {}
 
   T data;
+
  private:
-  friend class RefCountedThreadSafe<RefCountedData<T>>;
-  ~RefCountedData();
+  friend class mrpc::RefCountedThreadSafe<mrpc::RefCountedData<T> >;
+  ~RefCountedData() {}
 };
 
-// Smart pointer
-template<typename T>
+}  // namespace base
+
+//
+// A smart pointer class for reference counted objects.  Use this class instead
+// of calling AddRef and Release manually on a reference counted object to
+// avoid common memory leaks caused by forgetting to Release an object
+// reference.  Sample usage:
+//
+//   class MyFoo : public RefCounted<MyFoo> {
+//    ...
+//   };
+//
+//   void some_function() {
+//     scoped_refptr<MyFoo> foo = new MyFoo();
+//     foo->Method(param);
+//     // |foo| is released when this function returns
+//   }
+//
+//   void some_other_function() {
+//     scoped_refptr<MyFoo> foo = new MyFoo();
+//     ...
+//     foo = NULL;  // explicitly releases |foo|
+//     ...
+//     if (foo)
+//       foo->Method(param);
+//   }
+//
+// The above examples show how scoped_refptr<T> acts like a pointer to T.
+// Given two scoped_refptr<T> classes, it is also possible to exchange
+// references between the two objects, like so:
+//
+//   {
+//     scoped_refptr<MyFoo> a = new MyFoo();
+//     scoped_refptr<MyFoo> b;
+//
+//     b.swap(a);
+//     // now, |b| references the MyFoo object, and |a| references NULL.
+//   }
+//
+// To make both |a| and |b| in the above example reference the same MyFoo
+// object, simply use the assignment operator:
+//
+//   {
+//     scoped_refptr<MyFoo> a = new MyFoo();
+//     scoped_refptr<MyFoo> b;
+//
+//     b = a;
+//     // now, |a| and |b| each own a reference to the same MyFoo object.
+//   }
+//
+template <class T>
 class scoped_refptr {
  public:
   typedef T element_type;
 
-  scoped_refptr() : ptr_(nullptr) {}
+  scoped_refptr() : ptr_(NULL) {
+  }
+
   scoped_refptr(T* p) : ptr_(p) {
-    if (ptr_) {
+    if (ptr_)
       AddRef(ptr_);
-    }
   }
 
-  // Copy constructor
+  // Copy constructor.
   scoped_refptr(const scoped_refptr<T>& r) : ptr_(r.ptr_) {
-    if (ptr_) {
+    if (ptr_)
       AddRef(ptr_);
-    }
   }
 
-  // Copy conversion constructor
-  template<typename U>
+  // Copy conversion constructor.
+  template <typename U>
   scoped_refptr(const scoped_refptr<U>& r) : ptr_(r.get()) {
-    if (ptr_) {
+    if (ptr_)
       AddRef(ptr_);
-    }
   }
 
-  scoped_refptr(scoped_refptr&& r) : ptr_(r.get()) {
-    r.ptr_ = nullptr;
-  }
+  // Move constructor. This is required in addition to the conversion
+  // constructor below in order for clang to warn about pessimizing moves.
+  scoped_refptr(scoped_refptr&& r) : ptr_(r.get()) { r.ptr_ = nullptr; }
 
-  template<typename U>
+  // Move conversion constructor.
+  template <typename U>
   scoped_refptr(scoped_refptr<U>&& r) : ptr_(r.get()) {
     r.ptr_ = nullptr;
   }
 
   ~scoped_refptr() {
-    if (ptr_) {
+    if (ptr_)
       Release(ptr_);
-    }
   }
 
-  T* get() const {
-    return ptr_;
-  }
+  T* get() const { return ptr_; }
 
   T& operator*() const {
-    assert(ptr_ != nullptr);
+    assert(ptr_ != NULL);
     return *ptr_;
   }
 
   T* operator->() const {
-    assert(ptr_ != nullptr);
+    assert(ptr_ != NULL);
     return ptr_;
   }
 
   scoped_refptr<T>& operator=(T* p) {
-    if (p) {
+    // AddRef first so that self assignment should work
+    if (p)
       AddRef(p);
-    }
     T* old_ptr = ptr_;
     ptr_ = p;
-    if (old_ptr) {
+    if (old_ptr)
       Release(old_ptr);
-    }
     return *this;
   }
 
@@ -190,7 +295,7 @@ class scoped_refptr {
     return *this = r.ptr_;
   }
 
-  template<typename U>
+  template <typename U>
   scoped_refptr<T>& operator=(const scoped_refptr<U>& r) {
     return *this = r.get();
   }
@@ -200,7 +305,7 @@ class scoped_refptr {
     return *this;
   }
 
-  template<typename U>
+  template <typename U>
   scoped_refptr<T>& operator=(scoped_refptr<U>&& r) {
     scoped_refptr<T>(std::move(r)).swap(*this);
     return *this;
@@ -217,25 +322,31 @@ class scoped_refptr {
   }
 
  private:
-  template<typename U> friend class scoped_refptr;
+  template <typename U> friend class scoped_refptr;
 
+  // Allow scoped_refptr<T> to be used in boolean expressions, but not
+  // implicitly convertible to a real bool (which is dangerous).
+  //
+  // Note that this trick is only safe when the == and != operators
+  // are declared explicitly, as otherwise "refptr1 == refptr2"
+  // will compile but do the wrong thing (i.e., convert to Testable
+  // and then do the comparison).
   typedef T* scoped_refptr::*Testable;
- public:
-  operator Testable() const {
-    return ptr_ ? &scoped_refptr::ptr_ : nullptr;
-  }
 
-  template<typename U>
+ public:
+  operator Testable() const { return ptr_ ? &scoped_refptr::ptr_ : nullptr; }
+
+  template <typename U>
   bool operator==(const scoped_refptr<U>& rhs) const {
     return ptr_ == rhs.get();
   }
 
-  template<typename U>
+  template <typename U>
   bool operator!=(const scoped_refptr<U>& rhs) const {
     return !operator==(rhs);
   }
 
-  template<typename U>
+  template <typename U>
   bool operator<(const scoped_refptr<U>& rhs) const {
     return ptr_ < rhs.get();
   }
@@ -244,49 +355,56 @@ class scoped_refptr {
   T* ptr_;
 
  private:
+  // Non-inline helpers to allow:
+  //     class Opaque;
+  //     extern template class scoped_refptr<Opaque>;
+  // Otherwise the compiler will complain that Opaque is an incomplete type.
   static void AddRef(T* ptr);
   static void Release(T* ptr);
 };
 
-template<typename T>
+template <typename T>
 void scoped_refptr<T>::AddRef(T* ptr) {
   ptr->AddRef();
 }
 
-template<typename T>
+template <typename T>
 void scoped_refptr<T>::Release(T* ptr) {
   ptr->Release();
 }
 
-template<typename T>
+// Handy utility for creating a scoped_refptr<T> out of a T* explicitly without
+// having to retype all the template arguments
+template <typename T>
 scoped_refptr<T> make_scoped_refptr(T* t) {
   return scoped_refptr<T>(t);
 }
 
-template<typename T, typename U>
+// Temporary operator overloads to facilitate the transition. See
+// https://crbug.com/110610.
+template <typename T, typename U>
 bool operator==(const scoped_refptr<T>& lhs, const U* rhs) {
   return lhs.get() == rhs;
 }
 
-template<typename T, typename U>
+template <typename T, typename U>
 bool operator==(const T* lhs, const scoped_refptr<U>& rhs) {
   return lhs == rhs.get();
 }
 
-template<typename T, typename U>
+template <typename T, typename U>
 bool operator!=(const scoped_refptr<T>& lhs, const U* rhs) {
   return !operator==(lhs, rhs);
 }
 
-template<typename T, typename U>
+template <typename T, typename U>
 bool operator!=(const T* lhs, const scoped_refptr<U>& rhs) {
   return !operator==(lhs, rhs);
 }
 
-template<typename T>
+template <typename T>
 std::ostream& operator<<(std::ostream& out, const scoped_refptr<T>& p) {
   return out << p.get();
 }
 
-} // namespace mrpc
-#endif // MRPC_BASE_REF_COUNTED_H_
+#endif  // BASE_MEMORY_REF_COUNTED_H_

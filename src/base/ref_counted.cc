@@ -1,10 +1,11 @@
 #include "base/ref_counted.h"
+//#include "base/threading/thread_collision_warner.h"
 
 namespace mrpc {
 
 bool RefCountedThreadSafeBase::HasOneRef() const {
   return AtomicRefCountIsOne(
-    &const_cast<RefCountedThreadSafeBase*>(this)->ref_count_);
+      &const_cast<RefCountedThreadSafeBase*>(this)->ref_count_);
 }
 
 RefCountedThreadSafeBase::RefCountedThreadSafeBase() : ref_count_(0) {
@@ -24,4 +25,4 @@ bool RefCountedThreadSafeBase::Release() const {
   return false;
 }
 
-} // namespace mrpc
+}  // namespace base

@@ -1,7 +1,8 @@
 #include <iostream>
-#include <memory>
+//#include <memory>
 
 #include "base/thread.h"
+#include "base/scoped_ptr.h"
 
 using namespace mrpc;
 
@@ -23,10 +24,10 @@ class SimpleThread : public Thread {
 } // namespace mrpc
 
 int main() { 
-  std::unique_ptr<Thread> thread(new SimpleThread);
+  scoped_ptr<Thread> thread(new SimpleThread);
   thread->Start();
   std::cout << "Current Id: " << Thread::CurrentId() << std::endl;
-  Thread::Sleep(TimeDelta::FromSeconds(30));
+  //Thread::Sleep(TimeDelta::FromSeconds(30));
   thread->Join();
   return 0; 
 }
